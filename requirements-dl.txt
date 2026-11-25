@@ -1,0 +1,6 @@
+# Phase 2 (deep learning) deps - host venv only.
+# Deliberately NOT merged into requirements.txt: docker/airflow/Dockerfile installs
+# that file, and the Airflow image does not run DL training.
+-r requirements.txt
+torch>=2.3
+accelerate>=0.30

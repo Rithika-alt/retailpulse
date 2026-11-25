@@ -1,0 +1,21 @@
+# Optional: `accelerate launch` works without a config (single process, auto device).
+# Use with:  accelerate launch --config_file accelerate_config.yaml src/train_dl.py
+#
+# Single process (CPU, or one GPU if visible):
+compute_environment: LOCAL_MACHINE
+distributed_type: 'NO'
+mixed_precision: 'no'
+num_processes: 1
+num_machines: 1
+machine_rank: 0
+use_cpu: false
+downcast_bf16: 'no'
+same_network: true
+main_training_function: main
+rdzv_backend: static
+
+# Multi-GPU on one machine: change to
+#   distributed_type: MULTI_GPU
+#   num_processes: <number of GPUs>
+# or just override on the command line:
+#   accelerate launch --multi_gpu --num_processes 2 src/train_dl.py
