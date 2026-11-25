@@ -8,3 +8,8 @@ data/processed/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 mlruns_smoke/
+
+# Terraform (local state/providers; the lock file is committed)
+infra/.terraform/
+*.tfstate
+*.tfstate.*

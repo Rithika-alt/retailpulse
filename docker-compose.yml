@@ -12,6 +12,13 @@ x-airflow-common: &airflow-common
     PYTHONPATH: /opt/airflow
     RETAILPULSE_DATA_DIR: /opt/airflow/data
     MLFLOW_TRACKING_URI: http://mlflow:5000
+    # Phase 4: raw data bucket on LocalStack (dummy creds; the code refuses real AWS by default)
+    AWS_ENDPOINT_URL: http://localstack:4566
+    AWS_ACCESS_KEY_ID: test
+    AWS_SECRET_ACCESS_KEY: test
+    AWS_DEFAULT_REGION: us-east-1
+    RETAILPULSE_RAW_BUCKET: retailpulse-raw-data
+    RETAILPULSE_RAW_SOURCE: auto   # auto | s3 (strict) | local
   volumes:
     - ./dags:/opt/airflow/dags
     - ./src:/opt/airflow/src
@@ -57,6 +64,49 @@ services:
       - "5000:5000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 10s
+      retries: 10
+
+  # Phase 4: local AWS emulator (S3 only). Pinned Community image: `latest` now requires an
+  # account/auth token. Community edition has no persistence -> re-run scripts/upload_raw_data.py
+  # after the container is recreated.
+  localstack:
+    image: localstack/localstack:4.12
+    environment:
+      SERVICES: s3
+      DEBUG: "0"
+    ports:
+      - "4566:4566"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      retries: 10
+
+  # Phase 4: FastAPI inference service for whatever holds the `production` alias on
+  # retailpulse-champion. Separate image from Airflow (no torch, no airflow).
+  inference-api:
+    build:
+      context: .
+      dockerfile: docker/api/Dockerfile
+    image: retailpulse-api:latest
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      RETAILPULSE_RAW_BUCKET: retailpulse-raw-data
+    volumes:
+      - ./data:/app/data:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      mlflow:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
       interval: 10s
       retries: 10
 

@@ -1,0 +1,40 @@
+{
+  "instances": [
+    {
+      "item_id": "ITEM_000",
+      "store_id": "CA_1",
+      "cat_id": "FOODS",
+      "lag_7": 1.0,
+      "lag_14": 1.0,
+      "lag_28": 7.0,
+      "roll_mean_7": 2.7142857143,
+      "roll_std_7": 1.9760470401,
+      "roll_mean_28": 2.75,
+      "roll_std_28": 1.8978545392,
+      "day_of_week": 0,
+      "is_weekend": 0,
+      "is_holiday": 0,
+      "sell_price": 7.19,
+      "price_change_flag": 0,
+      "promo_flag": 0
+    },
+    {
+      "item_id": "ITEM_000",
+      "store_id": "CA_2",
+      "cat_id": "FOODS",
+      "lag_7": 2.0,
+      "lag_14": 4.0,
+      "lag_28": 0.0,
+      "roll_mean_7": 2.8571428571,
+      "roll_std_7": 1.3451854183,
+      "roll_mean_28": 4.1071428571,
+      "roll_std_28": 2.39349869,
+      "day_of_week": 0,
+      "is_weekend": 0,
+      "is_holiday": 0,
+      "sell_price": 7.35,
+      "price_change_flag": 0,
+      "promo_flag": 0
+    }
+  ]
+}

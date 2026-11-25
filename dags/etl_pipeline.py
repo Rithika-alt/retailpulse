@@ -55,15 +55,27 @@ def train_models() -> dict:
     return {k: {m: v for m, v in r.items() if m.startswith("test_") and "cat" not in m} for k, r in results.items()}
 
 
-def evaluate_and_gate() -> dict:
-    """Phase 3: compare the freshly trained XGBoost run to Production; promote or reject.
+def fetch_raw_from_s3_task():
+    """Phase 4: pull raw data from the S3 bucket (LocalStack) into data/raw/ when available.
 
-    A rejection is a valid outcome (task succeeds, decision is logged). Missing
-    metrics raise GateError, which fails this task.
+    RETAILPULSE_RAW_SOURCE: auto (default; falls back with a warning) | s3 (strict) | local.
+    The existing generate_or_load_raw_data task then just validates the downloaded file.
     """
-    from src.gate import run_gate
+    from src.storage import fetch_raw_from_s3
 
-    return run_gate(model_type="xgboost").to_dict()
+    return fetch_raw_from_s3(RAW_PATH)
+
+
+def evaluate_and_gate() -> dict:
+    """Gate every not-yet-gated candidate run (XGBoost from this DAG run, plus any LSTM run
+    trained manually on the host since the last execution), oldest first.
+
+    A rejection is a valid outcome (task succeeds, decision is logged). Missing metrics
+    raise GateError, which fails this task (the affected run stays ungated).
+    """
+    from src.gate import run_gate_pending
+
+    return [d.to_dict() for d in run_gate_pending()]
 
 
 with DAG(
@@ -81,4 +93,6 @@ with DAG(
 
     t_gate = PythonOperator(task_id="evaluate_and_gate", python_callable=evaluate_and_gate)
 
-    t_raw >> t_feat >> t_save >> t_train >> t_gate
+    t_fetch = PythonOperator(task_id="fetch_raw_from_s3", python_callable=fetch_raw_from_s3_task)
+
+    t_fetch >> t_raw >> t_feat >> t_save >> t_train >> t_gate

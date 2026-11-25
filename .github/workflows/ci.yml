@@ -25,8 +25,18 @@ jobs:
           python -m pip install --upgrade pip
           # CPU-only torch wheel keeps the install small; no GPU needed for tests
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install -r requirements-dl.txt
+          pip install -r requirements-dl.txt -r requirements-api.txt
 
       - name: Run tests
-        # Integration test in test_gate.py auto-skips: no MLflow server in CI.
+        # Integration tests (MLflow server, LocalStack) auto-skip: no servers in CI.
         run: python -m pytest -q
+
+  terraform:
+    # Syntax/structure check only. Never plan/apply; no AWS credentials exist or are needed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform -chdir=infra init -backend=false -input=false
+      - run: terraform -chdir=infra fmt -check
+      - run: terraform -chdir=infra validate

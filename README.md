@@ -90,11 +90,52 @@ python -m src.gate --model-type xgboost              # newest finished xgboost r
 python -m src.gate --model-type lstm                 # e.g. gate the LSTM (trained on the host)
 python -m src.gate --run-id <run_id>                 # a specific run
 ```
-The DAG's final task `evaluate_and_gate` gates the newest XGBoost run (a reject is a successful task with the
-decision in its log; missing metrics fail it). The LSTM is trained on the host, so gate it with the CLI.
+The DAG's final task `evaluate_and_gate` gates **every ungated** xgboost/lstm run in the experiment, oldest first
+(`run_gate_pending`; `python -m src.gate --pending [--dry-run]` does the same by hand). Each processed run (promote
+or reject) is tagged `gated=true` (+ `gate_decision`, `gate_reason`), so it is never evaluated twice; dry runs tag
+nothing. The LSTM is still trained manually on the host (`accelerate launch src/train_dl.py`); the next DAG run
+gates it automatically. A reject is a successful task with the decision in its log; a run with missing metrics
+fails the task, stays ungated and is retried next time (it does not block the other runs).
+Runs evaluated before this existed can be backfilled: `python -m src.gate --mark-gated <run_id>`.
 
 ## CI (`.github/workflows/ci.yml`)
 Runs `pytest` on every push and pull request (CPU torch, so all tests including the DL ones run). It is separate
 from the model gate. The MLflow integration test in `test_gate.py` skips itself when no server is reachable.
 **This folder is not a git repository yet**: `git init` here (so `.github/` sits at the repo root), push to GitHub,
 and the workflow will run.
+
+---
+
+# Phase 4 — LocalStack S3, inference API, Terraform
+
+```bash
+docker compose up -d --build        # adds: localstack (S3, :4566) and inference-api (:8000)
+python scripts/upload_raw_data.py   # data/raw/sales.csv -> s3://retailpulse-raw-data/raw/sales.csv (LocalStack)
+# trigger the DAG: the new first task `fetch_raw_from_s3` downloads it; the rest of the pipeline is unchanged
+curl -s localhost:8000/health
+curl -s -X POST localhost:8000/predict -H "Content-Type: application/json" -d @scripts/sample_request.json
+```
+
+- **Raw data source** (`RETAILPULSE_RAW_SOURCE`, set in `docker-compose.yml`): `auto` (default: use S3 if the object
+  exists, otherwise log a warning and use `data/raw/` / the generator, so Phase 1-3 work without LocalStack),
+  `s3` (strict: fail loudly), `local` (never touch S3). LocalStack Community does not persist data: re-run the upload
+  script after recreating the container. The image is pinned to `localstack/localstack:4.12` because `latest` now needs
+  a LocalStack account/auth token. `src/storage.py` refuses to build an S3 client unless `AWS_ENDPOINT_URL` points at
+  a non-AWS endpoint (or `ALLOW_REAL_AWS=1`), so nothing can reach real AWS by accident.
+- **Inference API** (`src/api/`): serves the model aliased `production` on `retailpulse-champion`, re-checking the alias
+  every 30 s and reloading when the gate promotes a new version. Only XGBoost champions are served; an LSTM champion
+  returns HTTP 501 (the image has no torch and an LSTM needs a 28-day window). Category codes come from the raw
+  data's sorted unique ids (XGBoost does not store them), so unknown ids are rejected with 422; logging the vocabulary
+  with the model in `train.py` would be the proper fix.
+- **Terraform** (`infra/`): validate-only. `docker run --rm -v "$PWD/infra:/workspace" -w /workspace hashicorp/terraform:1.9 init -backend=false`
+  then `... validate` (CI runs the same in a separate job).
+
+### What is actually running vs. what is only described
+Everything that executes here runs locally on Docker at zero cost: Airflow, MLflow (Postgres-backed registry), a
+LocalStack S3 emulator that stands in for the raw-data bucket, and a local FastAPI service that serves the current
+production model from the MLflow registry. The Terraform in `infra/` (S3 buckets, an ECR repository, an IAM role, and a
+SageMaker model, endpoint configuration and endpoint) describes how this would be deployed on real AWS, but it has only
+been checked with `terraform validate`: it was never planned or applied, no AWS credentials were ever configured, and none
+of those resources exist. It also would not deploy as-is: SageMaker expects `/ping` and `/invocations` on port 8080 and a
+model loaded from `/opt/ml/model`, whereas this API exposes `/health` and `/predict` and loads from the MLflow registry,
+and the `model_data_url` is a placeholder because nothing packages the champion model as `model.tar.gz`.
