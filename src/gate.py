@@ -21,7 +21,14 @@ tagged status=archived. A rejection never touches the registry.
 
 Deliberately imports only `mlflow` (no torch/xgboost) so it runs in the Airflow image.
 
-CLI:  python -m src.gate --model-type xgboost|lstm  |  --run-id <id>   [--dry-run]
+PENDING MODE (used by the Airflow task): every processed run (promote OR reject) is tagged
+gated=true. `run_gate_pending` gates every FINISHED xgboost/lstm run in the experiment that
+is not yet tagged gated=true, oldest first, each against the Production model as it stands
+after the previous one. Already-gated runs are never re-evaluated (so a decision cannot flip
+because the registry moved on). Dry runs tag nothing.
+
+CLI:  python -m src.gate --pending | --model-type xgboost|lstm | --run-id <id>   [--dry-run]
+      python -m src.gate --mark-gated <run_id>      # backfill: mark a run evaluated elsewhere
 """
 from __future__ import annotations
 
@@ -46,6 +53,8 @@ CHAMPION_MODEL_NAME = "retailpulse-champion"
 PRODUCTION_ALIAS = "production"
 EXPERIMENT = "retailpulse-demand"  # keep in sync with src/train.py
 REQUIRED_METRICS = ("test_wmape", "test_bias")
+GATED_TAG = "gated"
+GATEABLE_MODEL_TYPES = ("xgboost", "lstm")  # naive_seasonal has no model artifact to promote
 
 
 class GateError(RuntimeError):
@@ -187,6 +196,39 @@ def resolve_candidate(client: MlflowClient, model_type: str) -> str:
     return runs[0].info.run_id
 
 
+def find_ungated_runs(client: MlflowClient) -> list:
+    """FINISHED xgboost/lstm runs in the experiment without gated=true, oldest first."""
+    exp = client.get_experiment_by_name(EXPERIMENT)
+    if exp is None:
+        raise GateError(f"Experiment '{EXPERIMENT}' not found")
+    # The REST filter grammar has no tag IN/OR and unclear tag-absence semantics, so the server
+    # only filters on status; model_type and gated are checked below.
+    runs = client.search_runs(
+        [exp.experiment_id],
+        filter_string="attributes.status = 'FINISHED'",
+        order_by=["attributes.start_time ASC"],
+        max_results=1000,
+    )
+    # Filter + sort again client-side: don't rely on server-side tag-absence semantics or ordering.
+    pending = [
+        r for r in runs
+        if r.data.tags.get("model_type") in GATEABLE_MODEL_TYPES
+        and r.data.tags.get(GATED_TAG) != "true"
+    ]
+    return sorted(pending, key=lambda r: r.info.start_time)
+
+
+def mark_gated(client: MlflowClient, run_id: str, decision: GateDecision | None = None,
+               note: str | None = None) -> None:
+    client.set_tag(run_id, GATED_TAG, "true")
+    client.set_tag(run_id, "gated_at", datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    if decision is not None:
+        client.set_tag(run_id, "gate_decision", "promote" if decision.promote else "reject")
+        client.set_tag(run_id, "gate_reason", decision.reason[:250])
+    if note:
+        client.set_tag(run_id, "gate_note", note[:250])
+
+
 def evaluate_gate(
     candidate_run_id: str,
     production_model_name: str = CHAMPION_MODEL_NAME,
@@ -273,19 +315,58 @@ def run_gate(
         logger.info("Registry updated: %s v%s now has alias '%s'.", production_model_name, mv.version, PRODUCTION_ALIAS)
     else:
         logger.info("Registry left unchanged (candidate rejected).")
+    if not dry_run:  # tag only after the registry action succeeded
+        mark_gated(client, candidate_run_id, decision)
     return decision
 
 
-def main(argv=None) -> GateDecision:
+def run_gate_pending(
+    dry_run: bool = False,
+    production_model_name: str = CHAMPION_MODEL_NAME,
+    client: MlflowClient | None = None,
+) -> list[GateDecision]:
+    """Gate every ungated xgboost/lstm run, oldest first. One failing run does not block the
+    others (it stays ungated and is retried next time), but the call raises at the end."""
+    client = client or MlflowClient()
+    pending = find_ungated_runs(client)
+    if not pending:
+        logger.info("No ungated candidate runs in '%s'; nothing to gate.", EXPERIMENT)
+        return []
+    logger.info(
+        "%d ungated candidate run(s), oldest first: %s",
+        len(pending),
+        ", ".join(f"{r.data.tags.get('model_type')}:{r.info.run_id[:8]}" for r in pending),
+    )
+    decisions, errors = [], []
+    for r in pending:
+        try:
+            decisions.append(run_gate(r.info.run_id, None, dry_run, production_model_name, client))
+        except (GateError, MlflowException) as e:
+            logger.error("Could not gate run %s: %s", r.info.run_id, e)
+            errors.append(f"{r.info.run_id[:8]}: {e}")
+    if errors:
+        raise GateError(f"{len(errors)} run(s) could not be gated (left ungated): " + " | ".join(errors))
+    return decisions
+
+
+def main(argv=None):
     p = argparse.ArgumentParser(description="RetailPulse retrain gate")
     g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--pending", action="store_true", help="gate every ungated xgboost/lstm run, oldest first")
     g.add_argument("--run-id", help="candidate MLflow run id")
-    g.add_argument("--model-type", choices=["xgboost", "lstm"], help="use newest finished run of this type")
-    p.add_argument("--dry-run", action="store_true", help="decide but do not modify the registry")
+    g.add_argument("--model-type", choices=list(GATEABLE_MODEL_TYPES), help="use newest finished run of this type")
+    g.add_argument("--mark-gated", metavar="RUN_ID", help="tag a run gated=true without evaluating it (backfill)")
+    p.add_argument("--dry-run", action="store_true", help="decide but do not modify the registry or tags")
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     if os.environ.get("MLFLOW_TRACKING_URI") is None:
         logger.warning("MLFLOW_TRACKING_URI not set; using MLflow default (local ./mlruns)")
+    if args.mark_gated:
+        mark_gated(MlflowClient(), args.mark_gated, note="marked gated manually (evaluated outside the pending flow)")
+        logger.info("Run %s tagged gated=true.", args.mark_gated)
+        return None
+    if args.pending:
+        return run_gate_pending(dry_run=args.dry_run)
     return run_gate(args.run_id, args.model_type, dry_run=args.dry_run)
 
 
