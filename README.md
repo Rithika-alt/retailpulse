@@ -136,6 +136,22 @@ LocalStack S3 emulator that stands in for the raw-data bucket, and a local FastA
 production model from the MLflow registry. The Terraform in `infra/` (S3 buckets, an ECR repository, an IAM role, and a
 SageMaker model, endpoint configuration and endpoint) describes how this would be deployed on real AWS, but it has only
 been checked with `terraform validate`: it was never planned or applied, no AWS credentials were ever configured, and none
-of those resources exist. It also would not deploy as-is: SageMaker expects `/ping` and `/invocations` on port 8080 and a
-model loaded from `/opt/ml/model`, whereas this API exposes `/health` and `/predict` and loads from the MLflow registry,
-and the `model_data_url` is a placeholder because nothing packages the champion model as `model.tar.gz`.
+of those resources exist. The inference image now matches SageMaker's HTTP container contract (`GET /ping`,
+`POST /invocations` using the same prediction code as `/predict`, a configurable `PORT` that Terraform sets to 8080, and
+tolerance for the `serve` argument SageMaker starts containers with), and this was exercised locally on port 8080, so
+structurally the container is shaped for SageMaker. It still would not work there as-is: the API loads the model from the
+MLflow registry, which would not exist inside SageMaker, instead of from `/opt/ml/model`, and the `model_data_url` is a
+placeholder because nothing packages the champion model as `model.tar.gz`. The image has also never been pushed to ECR
+and no endpoint has ever been created.
+
+### SageMaker-style local test
+`GET /ping` returns 200 only when the production model is loaded and servable (503 otherwise; unlike `/health`, it
+loads the model if needed). `POST /invocations` takes `Content-Type: application/json` with `{"instances": [...]}` or a
+bare list, and returns the same JSON as `/predict`. `/health` and `/predict` are unchanged. The port comes from `$PORT`
+(default 8000; SageMaker requires 8080):
+```bash
+docker compose -f docker-compose.yml -f docker-compose.sagemaker.yml up -d inference-api   # container on 8080 -> host 8081
+curl -i localhost:8081/ping
+curl -s -X POST localhost:8081/invocations -H "Content-Type: application/json" -d @scripts/sample_request.json
+docker compose up -d inference-api                                                         # back to port 8000
+```

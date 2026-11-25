@@ -11,13 +11,18 @@
 # bucket below), a local FastAPI inference service (stands in for the endpoint), and a
 # local MLflow server (the model registry).
 #
+# SageMaker HTTP contract: the inference image now implements it. It serves GET /ping and
+# POST /invocations (same prediction code as /predict), listens on $PORT (set to 8080 below,
+# as SageMaker requires), and ignores the "serve" argument SageMaker starts containers with.
+# This was only exercised locally (docker-compose.sagemaker.yml), never on SageMaker itself.
+#
 # Known gaps before a real deploy (honest list):
-#   * SageMaker hosting containers must serve GET /ping and POST /invocations on
-#     port 8080 and load the model from /opt/ml/model. The FastAPI service exposes
-#     /health and /predict and loads from the MLflow registry, so it would need a
-#     SageMaker-compatible entrypoint.
+#   * Model loading: SageMaker would extract model_data_url into /opt/ml/model, but the API
+#     loads the model from the MLflow registry (MLFLOW_TRACKING_URI), which does not exist
+#     inside SageMaker. A packaged-model loading mode is not implemented.
 #   * model_data_url below is a PLACEHOLDER: nothing packages the MLflow "production"
 #     model as model.tar.gz into the artifacts bucket.
+#   * The image has never been pushed to ECR and the endpoint was never created.
 #   * S3 bucket names are globally unique; the defaults will likely need changing.
 # =============================================================================
 
@@ -169,6 +174,7 @@ resource "aws_sagemaker_model" "champion" {
     environment = {
       MLFLOW_MODEL_NAME  = "retailpulse-champion"
       MLFLOW_MODEL_ALIAS = "production"
+      PORT               = "8080" # SageMaker requires the container to listen on 8080
     }
   }
 

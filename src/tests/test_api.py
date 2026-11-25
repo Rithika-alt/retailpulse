@@ -173,3 +173,90 @@ def test_store_registry_error_is_unavailable(monkeypatch):
     store = ms.ChampionModelStore(client=object(), model_loader=lambda i: None, vocab_loader=lambda: VOCAB)
     with pytest.raises(ms.ModelUnavailable):
         store.get()
+
+
+# ---- SageMaker contract: /ping and /invocations ---------------------------------
+import json  # noqa: E402
+
+JSON_HEADERS = {"Content-Type": "application/json"}
+
+
+def invoke(c, body, headers=JSON_HEADERS):
+    """SageMaker InvokeEndpoint delivers the body as raw bytes plus a Content-Type."""
+    return c.post("/invocations", content=json.dumps(body).encode(), headers=headers)
+
+
+def test_ping_is_200_with_empty_body_when_model_is_servable():
+    r = client(FakeStore()).get("/ping")
+    assert r.status_code == 200 and r.content == b""
+
+
+def test_ping_503_when_registry_unavailable():
+    c = client(FakeStore(error=ms.ModelUnavailable("registry: connection refused")))
+    r = c.get("/ping")
+    assert r.status_code == 503 and "connection refused" in r.json()["detail"]
+
+
+def test_ping_503_when_champion_is_not_servable():
+    assert client(FakeStore(error=ms.UnsupportedModelType("it is lstm"))).get("/ping").status_code == 503
+
+
+def test_ping_actually_loads_the_model_unlike_health(monkeypatch):
+    from src import gate
+
+    monkeypatch.setattr(gate, "get_production", lambda c, n: type(
+        "MV", (), {"version": "1", "run_id": "r", "tags": {"source_model_type": "xgboost"}})())
+    loads = []
+    store = ms.ChampionModelStore(client=object(), model_loader=lambda i: loads.append(i) or FakeModel(),
+                                  vocab_loader=lambda: VOCAB)
+    c = client(store)
+    assert c.get("/health").json()["model_loaded"] is False and loads == []
+    assert c.get("/ping").status_code == 200 and len(loads) == 1
+    assert c.get("/health").json()["model_loaded"] is True
+
+
+def test_invocations_matches_predict_for_equivalent_input():
+    c = client(FakeStore())
+    body = {"instances": [instance(), instance(item_id="ITEM_000", sell_price=9.0)]}
+    via_predict = c.post("/predict", json=body)
+    via_invocations = invoke(c, body)
+    assert via_invocations.status_code == 200
+    assert via_invocations.json() == via_predict.json()
+
+
+def test_invocations_feeds_the_model_the_same_frame_as_predict():
+    s1, s2 = FakeStore(), FakeStore()
+    body = {"instances": [instance(), instance(store_id="TX_1", promo_flag=1)]}
+    client(s1).post("/predict", json=body)
+    invoke(client(s2), body)
+    assert s1.model.seen.equals(s2.model.seen)
+
+
+def test_invocations_accepts_bare_list_and_content_type_with_charset():
+    c = client(FakeStore())
+    expected = c.post("/predict", json={"instances": [instance()]}).json()
+    r = invoke(c, [instance()], headers={"Content-Type": "application/json; charset=utf-8"})
+    assert r.status_code == 200 and r.json() == expected
+
+
+def test_invocations_errors_mirror_predict():
+    c = client(FakeStore())
+    assert invoke(c, {"instances": [instance(item_id="NOPE")]}).status_code == 422
+    assert invoke(c, {"instances": [instance(day_of_week=9)]}).status_code == 422
+    assert invoke(c, {"instances": []}).status_code == 422
+    assert client(FakeStore(error=ms.ModelUnavailable("down"))).post(
+        "/invocations", content=json.dumps({"instances": [instance()]}), headers=JSON_HEADERS).status_code == 503
+    assert client(FakeStore(error=ms.UnsupportedModelType("lstm"))).post(
+        "/invocations", content=json.dumps({"instances": [instance()]}), headers=JSON_HEADERS).status_code == 501
+
+
+def test_invocations_rejects_bad_content_type_and_bad_json():
+    c = client(FakeStore())
+    assert c.post("/invocations", content=b"a,b,c", headers={"Content-Type": "text/csv"}).status_code == 415
+    assert c.post("/invocations", content=b"{not json", headers=JSON_HEADERS).status_code == 400
+
+
+def test_existing_endpoints_still_work_alongside_sagemaker_ones():
+    c = client(FakeStore())
+    assert c.get("/health").status_code == 200
+    assert c.post("/predict", json={"instances": [instance()]}).status_code == 200
